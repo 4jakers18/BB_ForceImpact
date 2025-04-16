@@ -1,290 +1,261 @@
+#!/usr/bin/env python3
+"""
+High‑speed reader for BOTA force/torque sensors
+   • Logs to CSV with wall‑clock derived from Sensor_Timestamp (µs)
+   • Zero host‑side timestamp jitter
+"""
+
 import sys
 import struct
 import time
 import threading
 import csv
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import namedtuple
+
 import pytz
 import serial
 from crc import Calculator, Configuration
 
 
+class BotaSerialSensorError(Exception):
+    """Custom exception for serial‑related problems"""
+    pass
+
+
 class BotaSerialSensor:
-    BOTA_PRODUCT_CODE = 123456
-    BAUDERATE = 460800
-    SINC_LENGTH = 64
-    CHOP_ENABLE = 0
-    FAST_ENABLE = 1
-    FIR_DISABLE = 1
-    TEMP_COMPENSATION = 0  # 0: Disabled (recommended), 1: Enabled
-    USE_CALIBRATION = 1    # 1: calibration matrix active, 0: raw measurements
-    DATA_FORMAT = 0        # 0: binary, 1: CSV
-    BAUDERATE_CONFIG = 4   # 0: 9600, 1: 57600, 2: 115200, 3: 230400, 4: 460800
-    FRAME_HEADER = b'\xAA'
+    # ---------------------------- device constants ---------------------------
+    BOTA_PRODUCT_CODE  = 123456
+    BAUDRATE           = 460_800
+    SINC_LENGTH        = 64
+    CHOP_ENABLE        = 0
+    FAST_ENABLE        = 1
+    FIR_DISABLE        = 1
+    TEMP_COMPENSATION  = 0   # 0: Disabled (recommended), 1: Enabled
+    USE_CALIBRATION    = 1   # 1: calibration matrix active, 0: raw
+    DATA_FORMAT        = 0   # 0: binary, 1: CSV
+    BAUDRATE_CONFIG    = 4   # 0:9600 1:57600 2:115200 3:230400 4:460800
+    FRAME_HEADER       = b'\xAA'
 
-    # Note that the time step is set according to the sinc filter size!
-    time_step = 0.01
+    # ------------------------------------------------------------------------
+    def __init__(self, port: str) -> None:
+        self._port                = port
+        self._ser                 = serial.Serial()
+        self._pd_thread_stop      = threading.Event()
 
-    def __init__(self, port):
-        self._port = port
-        self._ser = serial.Serial()
-        self._pd_thread_stop_event = threading.Event()
         DeviceSet = namedtuple('DeviceSet', 'name product_code config_func')
-        self._expected_device_layout = {
-            0: DeviceSet('BFT-SENS-SER-M8', self.BOTA_PRODUCT_CODE, self.bota_sensor_setup)
+        self._expected_device     = {
+            0: DeviceSet('BFT-SENS-SER-M8',
+                         self.BOTA_PRODUCT_CODE,
+                         self._sensor_setup)
         }
 
-        # Data variables
+        # ─── runtime data fields ────────────────────────────────────────────
         self.tz_chicago = pytz.timezone('America/Chicago')
 
-        self._status = None
-        self._fx = 0.0
-        self._fy = 0.0
-        self._fz = 0.0
-        self._mx = 0.0
-        self._my = 0.0
-        self._mz = 0.0
-        self._timestamp = 0.0
+        self._status = 0
+        self._fx = self._fy = self._fz = 0.0
+        self._mx = self._my = self._mz = 0.0
+        self._timestamp = 0               # raw µs from sensor (32‑bit)
         self._temperature = 0.0
 
-        # CSV-related
-        self._csvfile = None
+        # csv
+        self._csvfile   = None
         self._csvwriter = None
 
-    def bota_sensor_setup(self):
-        print("Trying to setup the sensor.")
-        # Wait for streaming of data
-        out = self._ser.read_until(bytes('App Init', 'ascii'))
-        if not self.contains_bytes(bytes('App Init', 'ascii'), out):
-            print("Sensor not streaming, check if correct port selected!")
+        # timestamp helpers
+        self._start_time                = None  # wall clock at first frame
+        self._initial_sensor_timestamp  = None  # first µs counter value
+        self._prev_sensor_timestamp     = None  # to detect rollovers
+        self._rollover_count            = 0     # 32‑bit wraps
+
+    # ------------------------------------------------------------------------
+    #                          sensor configuration
+    # ------------------------------------------------------------------------
+    def _sensor_setup(self) -> bool:
+        """Put sensor in RUN mode with desired filter & baud settings"""
+        print("Configuring sensor …")
+
+        # Wait for initial streaming text ("App Init")
+        if not self._wait_for(b'App Init'):
+            print("Sensor not streaming – wrong port?")
             return False
-        time.sleep(0.5)
+
         self._ser.reset_input_buffer()
         self._ser.reset_output_buffer()
 
-        # Go to CONFIG mode
-        cmd = bytes('C', 'ascii')
-        self._ser.write(cmd)
-        out = self._ser.read_until(bytes('r,0,C,0', 'ascii'))
-        if not self.contains_bytes(bytes('r,0,C,0', 'ascii'), out):
-            print("Failed to go to CONFIG mode.")
+        if not self._command(b'C', b'r,0,C,0'):   # CONFIG mode
+            print("Failed to enter CONFIG mode.")
             return False
 
-        # Communication setup
-        comm_setup = f"c,{self.TEMP_COMPENSATION},{self.USE_CALIBRATION},{self.DATA_FORMAT},{self.BAUDERATE_CONFIG}"
-        self._ser.write(bytes(comm_setup, 'ascii'))
-        out = self._ser.read_until(bytes('r,0,c,0', 'ascii'))
-        if not self.contains_bytes(bytes('r,0,c,0', 'ascii'), out):
-            print("Failed to set communication setup.")
+        comm = f"c,{self.TEMP_COMPENSATION},{self.USE_CALIBRATION}," \
+               f"{self.DATA_FORMAT},{self.BAUDRATE_CONFIG}"
+        if not self._command(comm.encode(), b'r,0,c,0'):
+            print("Communication setup failed.")
             return False
 
+        # Sample period depends on sinc length (not used for ts math anymore)
         self.time_step = 0.00001953125 * self.SINC_LENGTH
-        print("Timestep: {}".format(self.time_step))
+        print(f"Timestep (for reference): {self.time_step:.8f} s")
 
-        # Filter setup
-        filter_setup = f"f,{self.SINC_LENGTH},{self.CHOP_ENABLE},{self.FAST_ENABLE},{self.FIR_DISABLE}"
-        self._ser.write(bytes(filter_setup, 'ascii'))
-        out = self._ser.read_until(bytes('r,0,f,0', 'ascii'))
-        if not self.contains_bytes(bytes('r,0,f,0', 'ascii'), out):
-            print("Failed to set filter setup.")
+        filt = f"f,{self.SINC_LENGTH},{self.CHOP_ENABLE}," \
+               f"{self.FAST_ENABLE},{self.FIR_DISABLE}"
+        if not self._command(filt.encode(), b'r,0,f,0'):
+            print("Filter setup failed.")
             return False
 
-        # Go to RUN mode
-        self._ser.write(bytes('R', 'ascii'))
-        out = self._ser.read_until(bytes('r,0,R,0', 'ascii'))
-        if not self.contains_bytes(bytes('r,0,R,0', 'ascii'), out):
-            print("Failed to go to RUN mode.")
+        if not self._command(b'R', b'r,0,R,0'):   # RUN
+            print("Failed to enter RUN mode.")
             return False
 
         return True
 
-    def contains_bytes(self, subsequence, sequence):
-        return subsequence in sequence
+    # ------------------------------------------------------------------------
+    #                           serial helpers
+    # ------------------------------------------------------------------------
+    def _wait_for(self, token: bytes, timeout: float = 10.0) -> bool:
+        """Read until token or timeout"""
+        self._ser.timeout = timeout
+        data = self._ser.read_until(token)
+        return token in data
 
-    def _processdata_thread(self):
-        """
-        This thread reads frames from the sensor at high speed. Whenever a valid frame
-        is received and the CRC matches, we extract the data and store it in fields.
-        We also append to CSV once we have a good frame.
-        """
-        crc16X25Configuration = Configuration(16, 0x1021, 0xFFFF, 0xFFFF, True, True)
-        crc_calculator = Calculator(crc16X25Configuration)
+    def _command(self, cmd: bytes, expect: bytes) -> bool:
+        """Send cmd, wait for expect, return success"""
+        self._ser.write(cmd)
+        return self._wait_for(expect)
 
-        while not self._pd_thread_stop_event.is_set():
-            frame_synced = False
-            # Sync to frame
-            while not frame_synced and not self._pd_thread_stop_event.is_set():
-                possible_header = self._ser.read(1)
-                if self.FRAME_HEADER == possible_header:
-                    data_frame = self._ser.read(34)
-                    crc16_ccitt_frame = self._ser.read(2)
-                    crc16_ccitt = struct.unpack_from('H', crc16_ccitt_frame, 0)[0]
-                    checksum = crc_calculator.checksum(data_frame)
-                    if checksum == crc16_ccitt:
-                        print("Frame synced")
-                        frame_synced = True
-                    else:
-                        # not valid, attempt reading again
-                        self._ser.read(1)
+    # ------------------------------------------------------------------------
+    #                   high‑rate binary frame processing
+    # ------------------------------------------------------------------------
+    def _processdata_thread(self) -> None:
+        """Continuously read frames, verify CRC, write CSV rows"""
+        crc_cfg   = Configuration(16, 0x1021, 0xFFFF, 0xFFFF, True, True)
+        crc_calc  = Calculator(crc_cfg)
 
-            # Once synced, read frames continuously
-            while frame_synced and not self._pd_thread_stop_event.is_set():
-                start_time = time.perf_counter()
+        header = self.FRAME_HEADER
 
-                frame_header = self._ser.read(1)
-                if frame_header != self.FRAME_HEADER:
-                    print("Lost sync")
-                    frame_synced = False
-                    break
+        while not self._pd_thread_stop.is_set():
+            # ─── sync to header byte ────────────────────────────────────
+            if self._ser.read(1) != header:
+                continue
+            data_frame = self._ser.read(34)
+            crc_recv   = struct.unpack_from('H', self._ser.read(2))[0]
+            if crc_calc.checksum(data_frame) != crc_recv:
+                continue  # bad frame – resync
 
-                data_frame = self._ser.read(34)
-                crc16_ccitt_frame = self._ser.read(2)
+            # ─── parse binary frame ─────────────────────────────────────
+            self._status      = struct.unpack_from('H', data_frame, 0)[0]
+            self._fx          = struct.unpack_from('f', data_frame, 2)[0]
+            self._fy          = struct.unpack_from('f', data_frame, 6)[0]
+            self._fz          = struct.unpack_from('f', data_frame, 10)[0]
+            self._mx          = struct.unpack_from('f', data_frame, 14)[0]
+            self._my          = struct.unpack_from('f', data_frame, 18)[0]
+            self._mz          = struct.unpack_from('f', data_frame, 22)[0]
+            self._timestamp   = struct.unpack_from('I', data_frame, 26)[0]  # µs
+            self._temperature = struct.unpack_from('f', data_frame, 30)[0]
 
-                crc16_ccitt = struct.unpack_from('H', crc16_ccitt_frame, 0)[0]
-                checksum = crc_calculator.checksum(data_frame)
-                if checksum != crc16_ccitt:
-                    print("CRC mismatch received")
-                    break
+            # ─── establish t0 on very first good frame ──────────────────
+            if self._initial_sensor_timestamp is None:
+                self._initial_sensor_timestamp = self._timestamp
+                self._prev_sensor_timestamp    = self._timestamp
+                self._start_time = datetime.now(self.tz_chicago)
+            else:
+                # handle 32‑bit rollover (wrap every ~71 min)
+                if self._timestamp < self._prev_sensor_timestamp:
+                    self._rollover_count += 1
+                self._prev_sensor_timestamp = self._timestamp
 
-                # Parse data from frame
-                self._status = struct.unpack_from('H', data_frame, 0)[0]
-                self._fx = struct.unpack_from('f', data_frame, 2)[0]
-                self._fy = struct.unpack_from('f', data_frame, 6)[0]
-                self._fz = struct.unpack_from('f', data_frame, 10)[0]
-                self._mx = struct.unpack_from('f', data_frame, 14)[0]
-                self._my = struct.unpack_from('f', data_frame, 18)[0]
-                self._mz = struct.unpack_from('f', data_frame, 22)[0]
-                self._timestamp = struct.unpack_from('I', data_frame, 26)[0]
-                self._temperature = struct.unpack_from('f', data_frame, 30)[0]
+            # 64‑bit extended microsecond counter
+            full_us = (self._rollover_count << 32) + self._timestamp
+            init_us = (self._rollover_count << 32) + self._initial_sensor_timestamp
+            delta_us = full_us - init_us
 
-                # Log data to CSV with an ISO UTC timestamp
-                now_chicago = datetime.now(self.tz_chicago)
-                # Convert to nanoseconds since the Unix epoch
-                # timestamp() gives seconds as a float, so multiply by 1e9
-                nanoseconds = int(now_chicago.timestamp() * 1e9)
-                utc_str = datetime.now()
-                self._csvwriter.writerow([
-                    now_chicago.isoformat(),
-                    self._status,
-                    self._fx,
-                    self._fy,
-                    self._fz,
-                    self._mx,
-                    self._my,
-                    self._mz,
-                    self._timestamp,
-                    self._temperature
-                ])
-                self._csvfile.flush()
+            sample_time = self._start_time + timedelta(microseconds=delta_us)
 
-                time_diff = time.perf_counter() - start_time
-                # If you'd like to limit loop speed, you can sleep here:
-                # time.sleep(max(0.0, 0.01 - time_diff))
+            # ─── CSV row ────────────────────────────────────────────────
+            self._csvwriter.writerow([
+                sample_time.isoformat(),  # America/Chicago
+                self._status,
+                self._fx, self._fy, self._fz,
+                self._mx, self._my, self._mz,
+                self._timestamp,          # raw 32‑bit µs counter
+                self._temperature
+            ])
+            self._csvfile.flush()  # or use buffering if perf demands
 
-    def _my_loop(self):
-        """
-        Lower speed loop that just prints out the last read values
-        once per second.
-        """
+    # ------------------------------------------------------------------------
+    #                   optional slow diagnostic print loop
+    # ------------------------------------------------------------------------
+    def _telemetry_loop(self) -> None:
         try:
             while True:
-                print('Run my loop')
-                print("Status {}".format(self._status))
-                print("Fx {}".format(self._fx))
-                print("Fy {}".format(self._fy))
-                print("Fz {}".format(self._fz))
-                print("Mx {}".format(self._mx))
-                print("My {}".format(self._my))
-                print("Mz {}".format(self._mz))
-                print("Timestamp {}".format(self._timestamp))
-                print("Temperature {}\n".format(self._temperature))
+                print(f"Fx:{self._fx:+.3f}  Fy:{self._fy:+.3f}  Fz:{self._fz:+.3f}  "
+                      f"Mx:{self._mx:+.3f}  My:{self._my:+.3f}  Mz:{self._mz:+.3f}  "
+                      f"Ts:{self._timestamp}  T:{self._temperature:.2f}")
                 time.sleep(1.0)
-
         except KeyboardInterrupt:
-            print('Stopped by user.')
+            print("User interrupted telemetry loop.")
 
-    def run(self,csv_prefix='sensor_data'):
-        self._ser.baudrate = self.BAUDERATE
-        self._ser.port = self._port
-        self._ser.timeout = 10
+    # ------------------------------------------------------------------------
+    #                                 run
+    # ------------------------------------------------------------------------
+    def run(self, csv_prefix: str = 'sensor_data') -> None:
+        # serial port setup
+        self._ser.baudrate = self.BAUDRATE
+        self._ser.port     = self._port
+        self._ser.timeout  = 10
 
-        # Open the CSV file and write a header row
-
-         # Build the CSV filename as <prefix>_YYYYmmdd_HHMMSS.csv
-        timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-        csv_filename = f"{csv_prefix}_{timestamp_str}.csv"
-
-        self._csvfile = open(csv_filename, 'w', newline='')
+        # CSV file prep
+        ts_str      = datetime.now().strftime('%Y%m%d_%H%M%S')
+        csv_name    = f"{csv_prefix}_{ts_str}.csv"
+        self._csvfile   = open(csv_name, 'w', newline='')
         self._csvwriter = csv.writer(self._csvfile)
         self._csvwriter.writerow([
-            'UTC_Time', 'Status', 'Fx', 'Fy', 'Fz', 'Mx', 'My', 'Mz',
-            'Sensor_Timestamp', 'Temperature'
+            'Chicago_Time', 'Status',
+            'Fx', 'Fy', 'Fz', 'Mx', 'My', 'Mz',
+            'Sensor_Timestamp_µs', 'Temperature'
         ])
 
+        # open port
         try:
             self._ser.open()
-            print("Opened serial port {}".format(self._port))
-        except:
-            raise BotaSerialSensorError('Could not open port')
+            print(f"Serial port {self._port} opened.")
+        except Exception as exc:
+            raise BotaSerialSensorError(f"Could not open {self._port}: {exc}")
 
-        if not self._ser.is_open:
-            raise BotaSerialSensorError('Could not open port')
-
-        if not self.bota_sensor_setup():
-            print('Could not setup sensor!')
+        # sensor configuration
+        if not self._sensor_setup():
             self._csvfile.close()
-            return
+            raise BotaSerialSensorError("Sensor setup failed.")
 
-        # Start the processing thread
-        proc_thread = threading.Thread(target=self._processdata_thread)
-        proc_thread.start()
+        # start frame‑processing thread
+        proc = threading.Thread(target=self._processdata_thread, daemon=True)
+        proc.start()
 
-        device_running = True
+        # optional live printout
+        self._telemetry_loop()
 
-        if device_running:
-            self._my_loop()
-
-        # Once done, signal threads to stop and close everything
-        self._pd_thread_stop_event.set()
-        proc_thread.join()
+        # cleanup on exit
+        self._pd_thread_stop.set()
+        proc.join()
         self._ser.close()
         self._csvfile.close()
 
-        if not device_running:
-            raise BotaSerialSensorError('Device is not running')
 
-    @staticmethod
-    def _sleep(duration, get_now=time.perf_counter):
-        now = get_now()
-        end = now + duration
-        while now < end:
-            now = get_now()
-
-
-class BotaSerialSensorError(Exception):
-    def __init__(self, message):
-        super(BotaSerialSensorError, self).__init__(message)
-        self.message = message
-
-
+# --------------------------------------------------------------------------- #
+#                                   main
+# --------------------------------------------------------------------------- #
 if __name__ == '__main__':
-    print('bota_serial_example started')
-    
-    if len(sys.argv) > 1:
-        try:
-            portname = sys.argv[1]
+    if len(sys.argv) < 2:
+        print("Usage: bota_serial_example <portname> [csv_prefix]")
+        sys.exit(1)
 
-            if len(sys.argv) > 2:
-                prefix = sys.argv[2]
-            else:
-                prefix = 'sensor_data'
+    portname = sys.argv[1]
+    prefix   = sys.argv[2] if len(sys.argv) > 2 else 'sensor_data'
 
-            bota_sensor_1 = BotaSerialSensor(portname)
-            bota_sensor_1.run(csv_prefix=prefix)
-        except BotaSerialSensorError as expt:
-            print('bota_serial_example failed: ' + expt.message)
-            sys.exit(1)
-    else:
-        print('usage: bota_serial_example portname [csv_prefix]')
+    try:
+        sensor = BotaSerialSensor(portname)
+        sensor.run(csv_prefix=prefix)
+    except BotaSerialSensorError as e:
+        print(f"Fatal: {e}")
         sys.exit(1)
